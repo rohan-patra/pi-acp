@@ -46,6 +46,9 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
             thinkingLevel: 'high',
             model: { provider: 'test', id: 'beta' }
           }
+        },
+        async getAvailableThinkingLevels() {
+          return { levels: ['off', 'low', 'high', 'max'] }
         }
       },
       setStartupInfo() {},
@@ -58,7 +61,7 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
     const result = await agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any)
 
     assert.equal(result.models?.currentModelId, 'test/beta')
-    assert.equal(result.modes?.currentModeId, 'high')
+    assert.equal('modes' in result, false)
     assert.deepEqual(result.configOptions, [
       {
         type: 'select',
@@ -81,11 +84,9 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
         currentValue: 'high',
         options: [
           { value: 'off', name: 'Thinking: off', description: null },
-          { value: 'minimal', name: 'Thinking: minimal', description: null },
           { value: 'low', name: 'Thinking: low', description: null },
-          { value: 'medium', name: 'Thinking: medium', description: null },
           { value: 'high', name: 'Thinking: high', description: null },
-          { value: 'xhigh', name: 'Thinking: xhigh', description: null }
+          { value: 'max', name: 'Thinking: max', description: null }
         ]
       }
     ])
@@ -117,9 +118,13 @@ test('PiAcpAgent: setSessionConfigOption maps model changes to pi and emits conf
       async getState() {
         return state
       },
+      async getAvailableThinkingLevels() {
+        return { levels: state.model.id === 'alpha' ? ['off', 'low'] : ['off', 'high', 'max'] }
+      },
       async setModel(provider: string, modelId: string) {
         setModelCalls.push({ provider, modelId })
         state.model = { provider, id: modelId }
+        state.thinkingLevel = modelId === 'alpha' ? 'low' : 'high'
       }
     }
   }
@@ -135,7 +140,23 @@ test('PiAcpAgent: setSessionConfigOption maps model changes to pi and emits conf
 
   assert.deepEqual(setModelCalls, [{ provider: 'test', modelId: 'beta' }])
   assert.equal(result.configOptions.find(option => option.id === 'model')?.currentValue, 'test/beta')
+  const thoughtLevelOption = result.configOptions.find(
+    (option): option is Extract<(typeof result.configOptions)[number], { type: 'select' }> =>
+      option.id === 'thought_level' && option.type === 'select'
+  )
+  assert.deepEqual(thoughtLevelOption?.options, [
+    { value: 'off', name: 'Thinking: off', description: null },
+    { value: 'high', name: 'Thinking: high', description: null },
+    { value: 'max', name: 'Thinking: max', description: null }
+  ])
   assert.deepEqual(conn.updates, [
+    {
+      sessionId: 's1',
+      update: {
+        sessionUpdate: 'current_mode_update',
+        currentModeId: 'high'
+      }
+    },
     {
       sessionId: 's1',
       update: {
@@ -146,7 +167,7 @@ test('PiAcpAgent: setSessionConfigOption maps model changes to pi and emits conf
   ])
 })
 
-test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and emits sync updates', async () => {
+test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and emits Pi-confirmed sync updates', async () => {
   const conn = new FakeAgentSideConnection()
   const state = {
     thinkingLevel: 'medium',
@@ -165,6 +186,9 @@ test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and em
       },
       async getState() {
         return state
+      },
+      async getAvailableThinkingLevels() {
+        return { levels: ['off', 'low', 'medium', 'high', 'xhigh'] }
       },
       async setThinkingLevel(level: string) {
         thinkingLevels.push(level)

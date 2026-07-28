@@ -61,6 +61,10 @@ export class FakePiRpcProcess {
     return { models: [{ provider: 'test', id: 'model', name: 'model' }] }
   }
 
+  async getAvailableThinkingLevels(): Promise<any> {
+    return { levels: ['off'] }
+  }
+
   async getMessages(): Promise<any> {
     return { messages: [] }
   }

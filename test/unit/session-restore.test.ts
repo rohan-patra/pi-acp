@@ -194,6 +194,13 @@ test('PiAcpAgent: setSessionConfigOption auto-restores via pi session discovery 
       {
         sessionId: 'fallback-session',
         update: {
+          sessionUpdate: 'current_mode_update',
+          currentModeId: 'medium'
+        }
+      },
+      {
+        sessionId: 'fallback-session',
+        update: {
           sessionUpdate: 'config_option_update',
           configOptions: result.configOptions
         }
