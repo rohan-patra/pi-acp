@@ -50,6 +50,9 @@
     "zod": "^3.25.0"
   },
   "devDependencies": {
+    "@earendil-works/pi-agent-core": "^0.82.1",
+    "@earendil-works/pi-ai": "^0.82.1",
+    "@earendil-works/pi-coding-agent": "^0.82.1",
     "@eslint/js": "^9.17.0",
     "@types/node": "^22.0.0",
     "eslint": "^9.17.0",

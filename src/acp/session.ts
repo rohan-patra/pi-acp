@@ -27,6 +27,7 @@ import {
   isBashTool
 } from './translate/bash.js'
 import { toolResultToText } from './translate/pi-tools.js'
+import type { ImageContent } from '@earendil-works/pi-ai'
 
 type SessionCreateParams = {
   cwd: string
@@ -45,7 +46,7 @@ type PendingTurn = {
 
 type TurnInput = PendingTurn & {
   message: string
-  images: unknown[]
+  images: ImageContent[]
 }
 
 type ReplacementHandoff = {
@@ -362,7 +363,7 @@ export class PiAcpSession {
     })
   }
 
-  async prompt(message: string, images: unknown[] = []): Promise<StopReason> {
+  async prompt(message: string, images: ImageContent[] = []): Promise<StopReason> {
     // pi RPC mode disables slash command expansion, so we do it here.
     const expandedMessage = expandSlashCommand(message, this.fileCommands)
 

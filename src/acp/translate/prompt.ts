@@ -1,10 +1,7 @@
 import type { ContentBlock } from '@agentclientprotocol/sdk'
+import type { ImageContent as PiImage } from '@earendil-works/pi-ai'
 
-export type PiImage = {
-  type: 'image'
-  mimeType: string
-  data: string
-}
+export type { PiImage }
 
 export function promptToPiMessage(blocks: ContentBlock[]): {
   message: string

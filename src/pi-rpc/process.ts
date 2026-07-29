@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import * as readline from 'node:readline'
+import type { RpcCommand as PiRpcCommand, RpcExtensionUIResponse, RpcResponse } from '@earendil-works/pi-coding-agent'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
 
 export class PiRpcSpawnError extends Error {
@@ -27,48 +28,11 @@ function stripAnsi(s: string): string {
   return s.replace(ANSI_ESCAPE_REGEX, '')
 }
 
-type PiRpcCommand =
-  | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
-  | { type: 'steer'; id?: string; message: string; images?: unknown[] }
-  | { type: 'abort'; id?: string }
-  | { type: 'get_state'; id?: string }
-  // Model
-  | { type: 'get_available_models'; id?: string }
-  | { type: 'set_model'; id?: string; provider: string; modelId: string }
-  // Thinking
-  | { type: 'get_available_thinking_levels'; id?: string }
-  | { type: 'set_thinking_level'; id?: string; level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' }
-  // Modes
-  | { type: 'set_follow_up_mode'; id?: string; mode: 'all' | 'one-at-a-time' }
-  | { type: 'set_steering_mode'; id?: string; mode: 'all' | 'one-at-a-time' }
-  // Compaction
-  | { type: 'compact'; id?: string; customInstructions?: string }
-  | { type: 'set_auto_compaction'; id?: string; enabled: boolean }
-  // Session
-  | { type: 'get_session_stats'; id?: string }
-  | { type: 'set_session_name'; id?: string; name: string }
-  | { type: 'export_html'; id?: string; outputPath?: string }
-  | { type: 'switch_session'; id?: string; sessionPath: string }
-  // Messages
-  | { type: 'get_messages'; id?: string }
-  // Commands
-  | { type: 'get_commands'; id?: string }
-
-type PiRpcResponse = {
-  type: 'response'
-  id?: string
-  command: string
-  success: boolean
-  data?: unknown
-  error?: string
-}
-
-type PiExtensionUiResponse =
-  | { id: string; value: string }
-  | { id: string; confirmed: boolean }
-  | { id: string; cancelled: true }
-
 export type PiRpcEvent = Record<string, unknown>
+type PiRpcResponse = RpcResponse & { data?: unknown }
+type PiImage = NonNullable<Extract<PiRpcCommand, { type: 'prompt' }>['images']>[number]
+type WithoutType<T> = T extends unknown ? Omit<T, 'type'> : never
+type PiExtensionUiResponse = WithoutType<RpcExtensionUIResponse>
 
 type SpawnParams = {
   cwd: string
@@ -234,12 +198,12 @@ export class PiRpcProcess {
     return lines
   }
 
-  async prompt(message: string, images: unknown[] = []): Promise<void> {
+  async prompt(message: string, images: PiImage[] = []): Promise<void> {
     const res = await this.request({ type: 'prompt', message, images })
     if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
   }
 
-  async steer(message: string, images: unknown[] = []): Promise<void> {
+  async steer(message: string, images: PiImage[] = []): Promise<void> {
     const res = await this.request({ type: 'steer', message, images })
     if (!res.success) throw new Error(`pi steer failed: ${res.error ?? JSON.stringify(res.data)}`)
   }
@@ -275,7 +239,7 @@ export class PiRpcProcess {
     return res.data
   }
 
-  async setThinkingLevel(level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'): Promise<void> {
+  async setThinkingLevel(level: Extract<PiRpcCommand, { type: 'set_thinking_level' }>['level']): Promise<void> {
     const res = await this.request({ type: 'set_thinking_level', level })
     if (!res.success) throw new Error(`pi set_thinking_level failed: ${res.error ?? JSON.stringify(res.data)}`)
   }

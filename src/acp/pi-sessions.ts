@@ -116,7 +116,7 @@ function pickTitleFromTail(tail: string): string | null {
   // We scan backwards line-by-line.
   const lines = tail.split(/\r?\n/)
   for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim()
+    const line = lines[i]?.trim()
     if (!line) continue
     try {
       const obj = JSON.parse(line) as any
@@ -195,7 +195,7 @@ function pickUpdatedAtFromTail(tail: string): string | null {
 
   // 1) Prefer the most recent message entry.
   for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim()
+    const line = lines[i]?.trim()
     if (!line) continue
     try {
       const obj = JSON.parse(line) as any
@@ -211,7 +211,7 @@ function pickUpdatedAtFromTail(tail: string): string | null {
 
   // 2) Fallback: any valid timestamp (covers sessions that somehow have no messages).
   for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim()
+    const line = lines[i]?.trim()
     if (!line) continue
     try {
       const obj = JSON.parse(line) as any

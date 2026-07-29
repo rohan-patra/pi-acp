@@ -29,7 +29,7 @@ function parseFrontmatter(content: string): {
 
   for (const line of frontmatterBlock.split('\n')) {
     const match = line.match(/^(\w+):\s*(.*)$/)
-    if (match) frontmatter[match[1]] = match[2].trim()
+    if (match?.[1] && match[2] !== undefined) frontmatter[match[1]] = match[2].trim()
   }
 
   return { frontmatter, content: remaining }

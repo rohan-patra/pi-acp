@@ -48,10 +48,10 @@ import { maybeAuthRequiredError } from './auth-required.js'
 import { isAbsolute } from 'node:path'
 import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
+import type { ThinkingLevel } from '@earendil-works/pi-agent-core'
 import { join, dirname, basename } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
-type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 type AdvertisedModel = {
   modelId: string
   name: string
@@ -1426,7 +1426,7 @@ async function setSessionModel(proc: PiRpcProcess, requestedModelId: string): Pr
 
   if (requestedModelId.includes('/')) {
     const [candidateProvider, ...rest] = requestedModelId.split('/')
-    provider = candidateProvider
+    provider = candidateProvider ?? null
     modelId = rest.join('/')
   } else {
     modelId = requestedModelId
