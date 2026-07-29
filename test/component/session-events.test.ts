@@ -712,16 +712,16 @@ test('PiAcpSession: cancel flips stopReason to cancelled', async () => {
 
   const p = session.prompt('hello')
   await session.cancel()
-  proc.emit({ type: 'agent_start' })
-  proc.emit({ type: 'turn_end' })
-  proc.emit({ type: 'agent_end' })
   const reason = await p
 
-  assert.equal(proc.abortCount, 1)
+  // ACP cancellation is settled immediately; physical Pi abort is deferred to
+  // allow Paseo's replacement prompt to become a native Pi steer.
+  assert.equal(proc.abortCount, 0)
   assert.equal(reason, 'cancelled')
+  proc.emit({ type: 'agent_end' })
 })
 
-test('PiAcpSession: queues concurrent prompt and starts it after agent_end', async () => {
+test('PiAcpSession: sends concurrent prompts to Pi as native steering', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -737,55 +737,21 @@ test('PiAcpSession: queues concurrent prompt and starts it after agent_end', asy
   const first = session.prompt('one')
   const second = session.prompt('two')
 
-  assert.equal(proc.prompts.length, 1)
-  assert.equal(proc.prompts[0]!.message, 'one')
+  assert.deepEqual(proc.prompts, [{ message: 'one', attachments: [] }])
+  assert.deepEqual(proc.steers, [])
+  proc.emit({ type: 'agent_start' })
+  assert.deepEqual(proc.steers, [{ message: 'two', attachments: [] }])
+  assert.equal(
+    conn.updates.some(update => String((update.update as any).content?.text ?? '').includes('Queued message')),
+    false
+  )
 
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'turn_end' })
   proc.emit({ type: 'agent_end' })
 
-  const r1 = await first
-  assert.equal(r1, 'end_turn')
-
-  assert.equal(proc.prompts.length, 2)
-  assert.equal(proc.prompts[1]!.message, 'two')
-
-  proc.emit({ type: 'agent_start' })
-  proc.emit({ type: 'turn_end' })
-  proc.emit({ type: 'agent_end' })
-
-  const r2 = await second
-  assert.equal(r2, 'end_turn')
-})
-
-test('PiAcpSession: cancel clears queued prompts', async () => {
-  const conn = new FakeAgentSideConnection()
-  const proc = new FakePiRpcProcess()
-
-  const session = new PiAcpSession({
-    sessionId: 's1',
-    cwd: process.cwd(),
-    mcpServers: [],
-    proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
-  })
-
-  const first = session.prompt('one')
-  const second = session.prompt('two')
-
-  assert.equal(proc.prompts.length, 1)
-
-  await session.cancel()
-  proc.emit({ type: 'agent_start' })
-  proc.emit({ type: 'turn_end' })
-  proc.emit({ type: 'agent_end' })
-
-  const r1 = await first
-  const r2 = await second
-
-  assert.equal(r1, 'cancelled')
-  assert.equal(r2, 'cancelled')
+  assert.equal(await first, 'end_turn')
+  assert.equal(await second, 'end_turn')
 })
 
 test('PiAcpSession: expands /command before sending to pi', async () => {

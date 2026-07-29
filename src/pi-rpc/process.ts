@@ -29,6 +29,7 @@ function stripAnsi(s: string): string {
 
 type PiRpcCommand =
   | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
+  | { type: 'steer'; id?: string; message: string; images?: unknown[] }
   | { type: 'abort'; id?: string }
   | { type: 'get_state'; id?: string }
   // Model
@@ -119,11 +120,13 @@ export class PiRpcProcess {
       const err = new Error(`pi process exited (code=${code}, signal=${signal})`)
       for (const [, p] of this.pending) p.reject(err)
       this.pending.clear()
+      for (const h of this.eventHandlers) h({ type: 'process_exit', error: err.message })
     })
 
     child.on('error', err => {
       for (const [, p] of this.pending) p.reject(err)
       this.pending.clear()
+      for (const h of this.eventHandlers) h({ type: 'process_exit', error: err.message })
     })
   }
 
@@ -234,6 +237,11 @@ export class PiRpcProcess {
   async prompt(message: string, images: unknown[] = []): Promise<void> {
     const res = await this.request({ type: 'prompt', message, images })
     if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  async steer(message: string, images: unknown[] = []): Promise<void> {
+    const res = await this.request({ type: 'steer', message, images })
+    if (!res.success) throw new Error(`pi steer failed: ${res.error ?? JSON.stringify(res.data)}`)
   }
 
   async abort(): Promise<void> {

@@ -43,12 +43,25 @@ type PendingTurn = {
   reject: (err: unknown) => void
 }
 
-type QueuedTurn = {
+type TurnInput = PendingTurn & {
   message: string
   images: unknown[]
-  resolve: (reason: StopReason) => void
-  reject: (err: unknown) => void
 }
+
+type ReplacementHandoff = {
+  generation: number
+  timer: ReturnType<typeof setTimeout>
+}
+
+type AbortInFlight = {
+  generation: number
+  settleTimer: ReturnType<typeof setTimeout>
+}
+
+// Paseo implements replacement as cancel -> wait for prompt completion -> prompt.
+// Hold the physical Pi loop briefly so that replacement prompt can become native Pi steering.
+const REPLACEMENT_HANDOFF_MS = 1_000
+const ABORT_SETTLE_MS = 5_000
 
 type PermissionResponse = Awaited<ReturnType<AgentSideConnection['requestPermission']>>
 
@@ -271,9 +284,25 @@ export class PiAcpSession {
   // Applies to the currently running turn.
   private cancelRequested = false
 
-  // Current in-flight turn (if any). Additional prompts are queued.
-  private pendingTurn: PendingTurn | null = null
-  private readonly turnQueue: QueuedTurn[] = []
+  // ACP prompt requests are logical turns. A single physical Pi agent loop can
+  // service several of them when an ACP client sends a prompt while Pi is running.
+  private pendingTurns: PendingTurn[] = []
+  private physicalPiRunActive = false
+  private replacementHandoff: ReplacementHandoff | null = null
+  private abortInFlight: AbortInFlight | null = null
+  private nextHandoffGeneration = 0
+  // Prompts arriving after the real abort starts must wait for the old physical
+  // loop to end; steering them into an already-aborted loop loses the message.
+  private deferredTurns: TurnInput[] = []
+  // A prompt RPC acknowledges before Pi necessarily starts its loop. Do not send
+  // a steer until agent_start confirms that the loop can accept it.
+  private preStartSteers: TurnInput[] = []
+  // A steer is applied only after Pi finishes the current turn. Keep the old
+  // turn quarantined until the next turn starts, not merely until steer RPC acks.
+  private resumeAfterTurnStart = false
+  // Do not append physical Pi output to a Paseo turn after it has been
+  // logically cancelled. Output resumes when its replacement steer arrives.
+  private suppressPiUpdates = false
   // Track tool call statuses and ensure they are monotonic (pending -> in_progress -> completed).
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
@@ -337,60 +366,45 @@ export class PiAcpSession {
     // pi RPC mode disables slash command expansion, so we do it here.
     const expandedMessage = expandSlashCommand(message, this.fileCommands)
 
-    const turnPromise = new Promise<StopReason>((resolve, reject) => {
-      const queued: QueuedTurn = { message: expandedMessage, images, resolve, reject }
+    return new Promise<StopReason>((resolve, reject) => {
+      const turn: TurnInput = { message: expandedMessage, images, resolve, reject }
 
-      // If a turn is already running, enqueue.
-      if (this.pendingTurn) {
-        this.turnQueue.push(queued)
-
-        // Best-effort: notify client that a prompt was queued.
-        // This doesn't work in Zed yet, needs to be revisited
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: `Queued message (position ${this.turnQueue.length}).`
-          }
-        })
-
-        // Also publish queue depth via session info metadata.
-        // This also not visible in the client
-        this.emit({
-          sessionUpdate: 'session_info_update',
-          _meta: { piAcp: { queueDepth: this.turnQueue.length, running: true } }
-        })
-
+      if (this.abortInFlight) {
+        this.deferredTurns.push(turn)
         return
       }
 
-      // No turn is running; start immediately.
-      this.startTurn(queued)
+      this.pendingTurns.push(turn)
+      if (this.replacementHandoff) {
+        clearTimeout(this.replacementHandoff.timer)
+        this.replacementHandoff = null
+        this.cancelRequested = false
+        this.resumeAfterTurnStart = true
+        // Paseo replacement prompt: preserve its cancel/settle UI contract while
+        // handing the message to Pi's native steering queue.
+        this.startSteeringTurn(turn)
+      } else if (this.physicalPiRunActive) {
+        // Pi owns active-loop message semantics. Do not recreate a second FIFO
+        // in the ACP adapter.
+        this.startSteeringTurn(turn)
+      } else {
+        this.startPromptTurn(turn)
+      }
     })
-
-    return turnPromise
   }
 
   async cancel(): Promise<void> {
-    // Cancel current and clear any queued prompts.
-    this.cancelRequested = true
+    if (!this.physicalPiRunActive || this.replacementHandoff || this.abortInFlight) return
 
-    if (this.turnQueue.length) {
-      const queued = this.turnQueue.splice(0, this.turnQueue.length)
-      for (const t of queued) t.resolve('cancelled')
-
-      this.emit({
-        sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text: 'Cleared queued prompts.' }
-      })
-      this.emit({
-        sessionUpdate: 'session_info_update',
-        _meta: { piAcp: { queueDepth: 0, running: Boolean(this.pendingTurn) } }
-      })
-    }
-
-    // Abort the currently running turn (if any). If nothing is running, this is a no-op.
-    await this.proc.abort()
+    // Resolve the ACP-facing prompt only after terminal tool updates have been
+    // delivered, matching the ordering guarantee used by agent_end below.
+    const cancelledTurns = this.pendingTurns.splice(0, this.pendingTurns.length)
+    this.cancelVisibleToolCalls()
+    this.cancelRequested = false
+    this.suppressPiUpdates = true
+    await this.flushEmits()
+    this.resolveTurns(cancelledTurns, 'cancelled')
+    this.startReplacementHandoff()
   }
 
   wasCancelRequested(): boolean {
@@ -470,50 +484,144 @@ export class PiAcpSession {
     this.bashOutputSnapshots.delete(toolCallId)
   }
 
-  private startTurn(t: QueuedTurn): void {
+  private cancelVisibleToolCalls(): void {
+    for (const toolCallId of this.currentToolCalls.keys()) {
+      this.emit({ sessionUpdate: 'tool_call_update', toolCallId, status: 'failed' })
+      this.cleanupToolCall(toolCallId)
+    }
+  }
+
+  private startPromptTurn(t: TurnInput): void {
     this.cancelRequested = false
     this.inAgentLoop = false
+    this.physicalPiRunActive = true
+    this.sendPiTurn(t, () => this.proc.prompt(t.message, t.images), true)
+  }
 
-    this.pendingTurn = { resolve: t.resolve, reject: t.reject }
+  private startSteeringTurn(t: TurnInput): void {
+    if (!this.inAgentLoop) {
+      this.preStartSteers.push(t)
+      return
+    }
+    this.sendPiTurn(t, () => this.proc.steer(t.message, t.images), false)
+  }
 
-    // Publish queue depth (0 because we're starting the turn now).
-    this.emit({
-      sessionUpdate: 'session_info_update',
-      _meta: { piAcp: { queueDepth: this.turnQueue.length, running: true } }
-    })
+  private flushPreStartSteers(): void {
+    const turns = this.preStartSteers.splice(0, this.preStartSteers.length)
+    for (const turn of turns) this.sendPiTurn(turn, () => this.proc.steer(turn.message, turn.images), false)
+  }
 
-    // Kick off pi, but completion is determined by pi events, not the RPC response.
-    // Important: pi may emit multiple `turn_end` events (e.g. when the model requests tools).
-    // The full prompt is finished when we see `agent_end`.
-    this.proc.prompt(t.message, t.images).catch(err => {
-      // If the subprocess errors before we get an `agent_end`, treat as error unless cancelled.
-      // Also ensure we flush any already-enqueued updates first.
+  private sendPiTurn(turn: PendingTurn, send: () => Promise<void>, startsPhysicalRun: boolean): void {
+    // Pi emits agent_end for the whole agent loop, not each steer request.
+    send().catch(err => {
       void this.flushEmits().finally(() => {
-        // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
         const authErr = maybeAuthRequiredError(err)
-        if (authErr) {
-          this.pendingTurn?.reject(authErr)
-        } else {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
-          this.pendingTurn?.resolve(reason)
+        const index = this.pendingTurns.indexOf(turn)
+        if (index >= 0) this.pendingTurns.splice(index, 1)
+        if (authErr) turn.reject(authErr)
+        else turn.resolve(this.cancelRequested ? 'cancelled' : 'error')
+
+        // A rejected steer leaves the existing Pi loop intact. A rejected
+        // initial prompt means no physical loop can ever produce agent_end, so
+        // release every prompt buffered for that not-yet-started loop too.
+        if (startsPhysicalRun) {
+          this.physicalPiRunActive = false
+          this.inAgentLoop = false
+          this.preStartSteers.splice(0)
+          this.rejectAllTurns(err)
         }
-
-        this.pendingTurn = null
-        this.inAgentLoop = false
-
-        // If the prompt failed, do not automatically proceed—pi may be unhealthy.
-        // But we still clear the queueDepth metadata.
-        this.emit({
-          sessionUpdate: 'session_info_update',
-          _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
-        })
       })
-      void err
     })
+  }
+
+  private resolvePendingTurns(reason: StopReason): void {
+    this.resolveTurns(this.pendingTurns.splice(0, this.pendingTurns.length), reason)
+  }
+
+  private resolveTurns(turns: PendingTurn[], reason: StopReason): void {
+    for (const turn of turns) turn.resolve(reason)
+  }
+
+  private rejectAllTurns(error: unknown): void {
+    const turns = [
+      ...this.pendingTurns.splice(0, this.pendingTurns.length),
+      ...this.deferredTurns.splice(0),
+      ...this.preStartSteers.splice(0)
+    ]
+    for (const turn of turns) turn.reject(error)
+  }
+
+  private startReplacementHandoff(): void {
+    const generation = ++this.nextHandoffGeneration
+    const timer = setTimeout(() => {
+      if (this.replacementHandoff?.generation !== generation) return
+      this.replacementHandoff = null
+      this.beginPhysicalAbort(generation)
+    }, REPLACEMENT_HANDOFF_MS)
+    this.replacementHandoff = { generation, timer }
+  }
+
+  private beginPhysicalAbort(generation: number): void {
+    const settleTimer = setTimeout(() => {
+      if (this.abortInFlight?.generation !== generation) return
+      this.failPhysicalRun(new Error('pi did not settle after abort'))
+      this.proc.dispose?.()
+    }, ABORT_SETTLE_MS)
+    this.abortInFlight = { generation, settleTimer }
+    this.cancelRequested = true
+    void this.proc.abort().catch(error => this.failPhysicalRun(error))
+  }
+
+  private clearAbortInFlight(): void {
+    if (!this.abortInFlight) return
+    clearTimeout(this.abortInFlight.settleTimer)
+    this.abortInFlight = null
+  }
+
+  private failPhysicalRun(error: unknown): void {
+    if (this.replacementHandoff) clearTimeout(this.replacementHandoff.timer)
+    this.replacementHandoff = null
+    this.clearAbortInFlight()
+    this.physicalPiRunActive = false
+    this.inAgentLoop = false
+    this.cancelRequested = false
+    this.suppressPiUpdates = false
+    this.resumeAfterTurnStart = false
+    this.rejectAllTurns(error)
+  }
+
+  private startDeferredTurns(): void {
+    const turns = this.deferredTurns.splice(0, this.deferredTurns.length)
+    if (!turns.length) return
+    const first = turns.shift()
+    if (!first) return
+    this.pendingTurns.push(first)
+    this.startPromptTurn(first)
+    for (const turn of turns) {
+      this.pendingTurns.push(turn)
+      this.startSteeringTurn(turn)
+    }
   }
 
   private handlePiEvent(ev: PiRpcEvent) {
     const type = String((ev as any).type ?? '')
+
+    // Pi remains active for the short cancel-to-replacement handoff. Those
+    // physical events belong to the cancelled logical ACP turn, so never let
+    // them append to Paseo's replacement timeline. A hidden permission must be
+    // answered too, otherwise Pi can remain blocked past the abort deadline.
+    if (this.suppressPiUpdates) {
+      if (type === 'extension_ui_request') {
+        const id = stringProp(ev, 'id')
+        if (id) void this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      }
+      if (type === 'turn_start' && this.resumeAfterTurnStart) {
+        this.suppressPiUpdates = false
+        this.resumeAfterTurnStart = false
+      } else if (type !== 'agent_end' && type !== 'agent_start') {
+        return
+      }
+    }
 
     switch (type) {
       case 'message_update': {
@@ -819,6 +927,7 @@ export class PiAcpSession {
 
       case 'agent_start': {
         this.inAgentLoop = true
+        this.flushPreStartSteers()
         break
       }
 
@@ -829,29 +938,32 @@ export class PiAcpSession {
       }
 
       case 'agent_end': {
-        // Ensure all updates derived from pi events are delivered before we resolve
-        // the ACP `session/prompt` request.
-        void this.flushEmits().finally(() => {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
-          this.pendingTurn?.resolve(reason)
-          this.pendingTurn = null
-          this.inAgentLoop = false
+        // Transition the physical state synchronously: a new ACP prompt may
+        // arrive before queued session updates finish flushing.
+        if (this.replacementHandoff) {
+          clearTimeout(this.replacementHandoff.timer)
+          this.replacementHandoff = null
+        }
+        this.clearAbortInFlight()
+        const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
+        this.physicalPiRunActive = false
+        this.inAgentLoop = false
+        this.preStartSteers.splice(0)
+        this.resumeAfterTurnStart = false
+        this.cancelRequested = false
+        this.suppressPiUpdates = false
 
-          // Start next queued prompt, if any.
-          const next = this.turnQueue.shift()
-          if (next) {
-            this.emit({
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
-            })
-            this.startTurn(next)
-          } else {
-            this.emit({
-              sessionUpdate: 'session_info_update',
-              _meta: { piAcp: { queueDepth: 0, running: false } }
-            })
-          }
+        // Pi emits agent_end only when the physical loop (including steers) is
+        // complete. It settles every logical ACP prompt registered to that loop.
+        void this.flushEmits().finally(() => {
+          this.resolvePendingTurns(reason)
+          this.startDeferredTurns()
         })
+        break
+      }
+
+      case 'process_exit': {
+        this.failPhysicalRun(new Error(String((ev as any).error ?? 'pi process exited')))
         break
       }
 
